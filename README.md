@@ -3,7 +3,7 @@
 Detects plugin jars added to or removed from `plugins/` and loads or unloads just those; lets you pick between several versions of the same plugin; and lets you enable, disable, restart or reload one specific plugin. Plugins you don't name are never touched.
 
 ## Install
-Drop `PluginSync-1.3.0.jar` into `plugins/` and restart once.
+Drop `PluginSync-1.4.0.jar` into `plugins/` and restart once.
 
 ## Commands
 Permission for all of them: `pluginsync.use` (default: op). They work from the console too. Alias: `/psync`.
@@ -19,8 +19,18 @@ Permission for all of them: `pluginsync.use` (default: op). They work from the c
 | `/pluginsync disable <plugin>` | Turn a plugin off (it stays loaded, so `enable` brings it back) |
 | `/pluginsync restart <plugin>` | Disable then enable the same plugin (no jar re-read) |
 | `/pluginsync reload <plugin>` | Unload and load it again from its jar, so a replaced jar takes effect |
+| `/pluginsync update` | Switch PluginSync itself to its newest jar (see below) |
 
 `disable`, `restart`, `reload` and `choose` refuse if another enabled plugin depends on the target. Add `-f` to do it anyway (you'll get a warning that the dependents may misbehave until a restart). PluginSync won't act on itself. Plugin names tab-complete.
+
+## Updating PluginSync itself
+Drop a newer PluginSync jar into `plugins/` (either next to the old one or overwriting it) and run `/pluginsync update` (same as `/pluginsync reload PluginSync`). PluginSync then replaces itself without a server restart:
+- With several PluginSync jars in the folder, the most recently modified one is used, and the older ones are archived according to `archive-unchosen`.
+- The new jar is checked first (it must have a `plugin.yml` and its main class). If it is bad, nothing happens.
+- If the new jar fails to load, the previous version is loaded again from its jar, if it is still in the folder.
+- All of PluginSync's classes are loaded into memory when it starts, so it keeps working even if its jar is overwritten on disk mid-update. The old class loader is only closed once the new version is running.
+
+This needs a PluginSync that already contains the feature (1.4.0 or newer), so the first time you have to restart the server once to get there. `/pluginsync choose PluginSync` and `/pluginsync scan` also understand the situation.
 
 ## Several versions of one plugin
 If two or more jars in `plugins/` have the same plugin name (for example `Foo-1.0.jar` and `Foo-1.1.jar`), `/pluginsync` does not guess. It leaves a running plugin running, skips loading that plugin, and prints a line like `Multiple jars for Foo: ...` that players can click. Then:
@@ -46,17 +56,6 @@ Targets Bukkit/Spigot/Paper/Purpur from 1.8 through 26.x with a single jar:
 `plugins/PluginSync/config.yml`:
 - `ignore:` plugin names that sync/scan will never load or unload.
 - `archive-unchosen:` see above (default `true`).
-
-## Behavior and limits
-- New jars are loaded in dependency order (depend/softdepend among the new jars).
-- A removed plugin is only unloaded if no other loaded plugin hard-depends on it.
-- `reload` needs exactly one jar in `plugins/` whose plugin.yml name matches; with several it asks you to `choose`.
-- If an unload works but the new load fails, the plugin stays unloaded and the error is shown.
-- Jars that only have `paper-plugin.yml` (no `plugin.yml`) are reported but not loaded at runtime.
-- Unloading uses reflection into server internals, so it is best-effort. Plugins that register commands through Paper's lifecycle/Brigadier API, or that leave threads/static references behind, may not unload completely. Restart if a plugin misbehaves.
-- Moving the old jar on Windows only works once the plugin has been unloaded and its jar released; if a move fails you're told which file to remove by hand.
-- Only compiled so far; not yet run on live servers. Test on a throwaway server for each version you care about.
-
 ## Developer note
 This plugin is coded with AI assistance and architected completely by me. Regardless, use at your own risk.
 
