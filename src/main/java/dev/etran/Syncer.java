@@ -1,7 +1,7 @@
 package dev.etran;
 
-import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandMap;
 import org.bukkit.command.PluginCommand;
@@ -11,9 +11,12 @@ import org.bukkit.plugin.PluginManager;
 
 import java.io.Closeable;
 import java.io.File;
+import java.io.FilenameFilter;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -28,12 +31,33 @@ import java.util.logging.Level;
 /**
  * Works out which plugin jars were added to / removed from the plugins folder since the server
  * started, and loads / unloads only those. Plugins that are already running are never touched.
+ *
+ * Compiled against the Bukkit 1.8 API so one jar runs on every newer server. Anything that does
+ * not exist in 1.8 (or changed since) is reached through reflection and is optional.
  */
 final class Syncer {
 
-    record Line(NamedTextColor color, String text) {}
+    static final class Line {
+        final ChatColor color;
+        final String text;
 
-    record Plan(List<JarInfo> toLoad, List<Plugin> toUnload, List<Line> notes) {
+        Line(ChatColor color, String text) {
+            this.color = color;
+            this.text = text;
+        }
+    }
+
+    static final class Plan {
+        final List<JarInfo> toLoad;
+        final List<Plugin> toUnload;
+        final List<Line> notes;
+
+        Plan(List<JarInfo> toLoad, List<Plugin> toUnload, List<Line> notes) {
+            this.toLoad = toLoad;
+            this.toUnload = toUnload;
+            this.notes = notes;
+        }
+
         boolean hasChanges() {
             return !toLoad.isEmpty() || !toUnload.isEmpty();
         }
@@ -49,18 +73,23 @@ final class Syncer {
 
     Plan scan() {
         PluginManager pm = Bukkit.getPluginManager();
-        File dir = self.getDataFolder().getParentFile();
+        File dir = self.getDataFolder().getAbsoluteFile().getParentFile();
         Path dirPath = dir.toPath().toAbsolutePath().normalize();
-        List<Line> notes = new ArrayList<>();
+        List<Line> notes = new ArrayList<Line>();
 
-        Set<String> ignore = new HashSet<>();
+        Set<String> ignore = new HashSet<String>();
         for (String s : self.getConfig().getStringList("ignore")) {
             ignore.add(lower(s));
         }
 
         // Every plugin jar currently in the folder, keyed by the plugin name inside it.
-        Map<String, JarInfo> byName = new LinkedHashMap<>();
-        File[] jars = dir.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
+        Map<String, JarInfo> byName = new LinkedHashMap<String, JarInfo>();
+        File[] jars = dir.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File d, String n) {
+                return n.toLowerCase(Locale.ROOT).endsWith(".jar");
+            }
+        });
         if (jars == null) {
             jars = new File[0];
         }
@@ -70,38 +99,40 @@ final class Syncer {
             if (info == null) {
                 continue; // not a plugin (library jar, etc.)
             }
-            JarInfo existing = byName.putIfAbsent(lower(info.name()), info);
+            JarInfo existing = byName.get(lower(info.name));
             if (existing != null) {
-                notes.add(new Line(NamedTextColor.YELLOW, "Ignoring " + jar.getName()
-                        + ": same plugin name as " + existing.file().getName()));
+                notes.add(new Line(ChatColor.YELLOW, "Ignoring " + jar.getName()
+                        + ": same plugin name as " + existing.file.getName()));
+            } else {
+                byName.put(lower(info.name), info);
             }
         }
 
         // New: a jar whose plugin isn't loaded.
-        List<JarInfo> toLoad = new ArrayList<>();
+        List<JarInfo> toLoad = new ArrayList<JarInfo>();
         for (JarInfo info : byName.values()) {
-            if (ignore.contains(lower(info.name()))) {
+            if (ignore.contains(lower(info.name))) {
                 continue;
             }
-            Plugin loaded = pm.getPlugin(info.name());
+            Plugin loaded = pm.getPlugin(info.name);
             if (loaded == null) {
-                if (info.paperOnly()) {
-                    notes.add(new Line(NamedTextColor.YELLOW, info.file().getName()
+                if (info.paperOnly) {
+                    notes.add(new Line(ChatColor.YELLOW, info.file.getName()
                             + " only has a paper-plugin.yml and can't be loaded at runtime; restart needed"));
                 } else {
                     toLoad.add(info);
                 }
             } else {
-                String running = loaded.getPluginMeta().getVersion();
-                if (!running.equals(info.version())) {
-                    notes.add(new Line(NamedTextColor.YELLOW, info.name() + ": jar is " + info.version()
+                String running = versionOf(loaded);
+                if (running != null && !running.equals(info.version)) {
+                    notes.add(new Line(ChatColor.YELLOW, info.name + ": jar is " + info.version
                             + " but " + running + " is running (restart to update)"));
                 }
             }
         }
 
         // Removed: a loaded plugin (from the plugins folder) with no matching jar anymore.
-        List<Plugin> toUnload = new ArrayList<>();
+        List<Plugin> toUnload = new ArrayList<Plugin>();
         for (Plugin p : pm.getPlugins()) {
             if (p == self || ignore.contains(lower(p.getName())) || byName.containsKey(lower(p.getName()))) {
                 continue;
@@ -120,17 +151,23 @@ final class Syncer {
 
     List<Line> apply(Plan plan) {
         PluginManager pm = Bukkit.getPluginManager();
-        List<Line> out = new ArrayList<>();
+        List<Line> out = new ArrayList<Line>();
         boolean changed = false;
 
         // 1. Unload removed plugins, dependents first.
-        List<Plugin> pending = new ArrayList<>(plan.toUnload());
+        List<Plugin> pending = new ArrayList<Plugin>(plan.toUnload);
         boolean progress = true;
         while (!pending.isEmpty() && progress) {
             progress = false;
             for (Iterator<Plugin> it = pending.iterator(); it.hasNext(); ) {
                 Plugin p = it.next();
-                boolean waitingOnOther = pending.stream().anyMatch(o -> o != p && dependsOn(o, p, true));
+                boolean waitingOnOther = false;
+                for (Plugin o : pending) {
+                    if (o != p && dependsOn(o, p, true)) {
+                        waitingOnOther = true;
+                        break;
+                    }
+                }
                 if (waitingOnOther) {
                     continue;
                 }
@@ -145,57 +182,56 @@ final class Syncer {
                     }
                 }
                 if (blocker != null) {
-                    out.add(new Line(NamedTextColor.RED, "Not unloading " + p.getName() + ": "
+                    out.add(new Line(ChatColor.RED, "Not unloading " + p.getName() + ": "
                             + blocker.getName() + " depends on it"));
                     continue;
                 }
                 try {
                     unload(p);
                     changed = true;
-                    out.add(new Line(NamedTextColor.GOLD, "Unloaded " + p.getName()));
+                    out.add(new Line(ChatColor.GOLD, "Unloaded " + p.getName()));
                 } catch (Throwable t) {
                     self.getLogger().log(Level.WARNING, "Failed to unload " + p.getName(), t);
-                    out.add(new Line(NamedTextColor.RED, "Failed to unload " + p.getName() + ": " + describe(t)));
+                    out.add(new Line(ChatColor.RED, "Failed to unload " + p.getName() + ": " + describe(t)));
                 }
             }
         }
         for (Plugin p : pending) {
-            out.add(new Line(NamedTextColor.RED, "Not unloading " + p.getName() + ": circular dependency"));
+            out.add(new Line(ChatColor.RED, "Not unloading " + p.getName() + ": circular dependency"));
         }
 
         // 2. Load new plugins, dependencies first.
-        for (JarInfo info : order(plan.toLoad())) {
+        for (JarInfo info : order(plan.toLoad)) {
             Plugin p = null;
             try {
-                p = pm.loadPlugin(info.file());
+                p = pm.loadPlugin(info.file);
                 if (p == null) {
-                    out.add(new Line(NamedTextColor.RED, "Failed to load " + info.file().getName()));
+                    out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName()));
                     continue;
                 }
                 p.onLoad();
                 pm.enablePlugin(p);
+                changed = true;
                 if (p.isEnabled()) {
-                    changed = true;
-                    out.add(new Line(NamedTextColor.GREEN, "Loaded " + info.name() + " " + info.version()));
+                    out.add(new Line(ChatColor.GREEN, "Loaded " + info.name + " " + info.version));
                 } else {
-                    changed = true;
                     cleanup(p);
-                    out.add(new Line(NamedTextColor.RED, info.name()
+                    out.add(new Line(ChatColor.RED, info.name
                             + " loaded but failed to enable (see console); it was unloaded again"));
                 }
             } catch (Throwable t) {
-                self.getLogger().log(Level.WARNING, "Failed to load " + info.file().getName(), t);
+                self.getLogger().log(Level.WARNING, "Failed to load " + info.file.getName(), t);
                 if (p != null) {
                     cleanup(p);
                 }
-                out.add(new Line(NamedTextColor.RED, "Failed to load " + info.file().getName() + ": " + describe(t)));
+                out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName() + ": " + describe(t)));
             }
         }
 
         if (changed) {
             refreshCommands();
         }
-        out.addAll(plan.notes());
+        out.addAll(plan.notes);
         return out;
     }
 
@@ -204,13 +240,26 @@ final class Syncer {
     private void unload(Plugin plugin) throws Exception {
         PluginManager pm = Bukkit.getPluginManager();
         ClassLoader loader = plugin.getClass().getClassLoader();
+        Object pluginLoader = null;
+        try {
+            pluginLoader = plugin.getPluginLoader();
+        } catch (Throwable ignored) {
+            // some server builds don't expose it
+        }
 
         pm.disablePlugin(plugin);   // cancels tasks, listeners, services, channels
         removeCommands(plugin);
-        removeFromManager(pm, plugin);
 
-        if (loader instanceof Closeable closeable) {
-            closeable.close();      // releases the jar file (matters on Windows)
+        // Bukkit has no API for forgetting a plugin, so remove it from the manager's internal
+        // plugin list / name lookup by reflection. Paper keeps these in an inner "instanceManager".
+        purge(pm, plugin);
+        purge(readField(pm, "instanceManager"), plugin);
+        if (pluginLoader != null) {
+            purge(pluginLoader, loader);   // the loader's registry of plugin class loaders
+        }
+
+        if (loader instanceof Closeable) {
+            ((Closeable) loader).close();  // releases the jar file (matters on Windows)
         }
     }
 
@@ -223,53 +272,88 @@ final class Syncer {
     }
 
     private void removeCommands(Plugin plugin) {
-        CommandMap map = Bukkit.getCommandMap();
-        Map<String, Command> known = map.getKnownCommands();
-        List<String> keys = new ArrayList<>();
+        Object commandMap = commandMap();
+        if (commandMap == null) {
+            return;
+        }
+        Map<String, Command> known = knownCommands(commandMap);
+        if (known == null) {
+            return;
+        }
+        List<String> keys = new ArrayList<String>();
         for (Map.Entry<String, Command> e : known.entrySet()) {
-            if (e.getValue() instanceof PluginCommand pc && pc.getPlugin() == plugin) {
+            Command c = e.getValue();
+            if (c instanceof PluginCommand && ((PluginCommand) c).getPlugin() == plugin) {
                 keys.add(e.getKey());
             }
         }
         for (String key : keys) {
             Command removed = known.remove(key);
-            if (removed != null) {
-                removed.unregister(map);
+            if (removed != null && commandMap instanceof CommandMap) {
+                removed.unregister((CommandMap) commandMap);
             }
         }
     }
 
-    /**
-     * Bukkit has no API for forgetting a plugin, so remove it from the manager's internal
-     * plugin list / name lookup by reflection. Paper keeps these in an inner "instanceManager".
-     */
-    private void removeFromManager(PluginManager pm, Plugin plugin) {
-        List<Object> targets = new ArrayList<>();
-        targets.add(pm);
-        Object inner = readField(pm, "instanceManager");
-        if (inner != null) {
-            targets.add(inner);
+    /** CraftServer#getCommandMap exists on every CraftBukkit/Spigot/Paper version. */
+    private static Object commandMap() {
+        try {
+            Object server = Bukkit.getServer();
+            return server.getClass().getMethod("getCommandMap").invoke(server);
+        } catch (Throwable t) {
+            return null;
         }
-        for (Object target : targets) {
-            for (Class<?> c = target.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (Field f : c.getDeclaredFields()) {
-                    if (Modifier.isStatic(f.getModifiers())) {
-                        continue;
-                    }
-                    if (!List.class.isAssignableFrom(f.getType()) && !Map.class.isAssignableFrom(f.getType())) {
-                        continue;
-                    }
-                    try {
-                        f.setAccessible(true);
-                        Object value = f.get(target);
-                        if (value instanceof List<?> list) {
-                            list.remove(plugin);
-                        } else if (value instanceof Map<?, ?> map) {
-                            map.values().removeIf(v -> v == plugin);
+    }
+
+    /** CommandMap#getKnownCommands exists on 1.13+; older servers keep a protected field. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Command> knownCommands(Object commandMap) {
+        try {
+            Method m = commandMap.getClass().getMethod("getKnownCommands");
+            return (Map<String, Command>) m.invoke(commandMap);
+        } catch (Throwable ignored) {
+            // fall through to field access
+        }
+        for (Class<?> c = commandMap.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField("knownCommands");
+                f.setAccessible(true);
+                return (Map<String, Command>) f.get(commandMap);
+            } catch (Throwable ignored) {
+                // try superclass
+            }
+        }
+        return null;
+    }
+
+    /** Removes {@code victim} from every list / map field of {@code target}. */
+    private static void purge(Object target, final Object victim) {
+        if (target == null || victim == null) {
+            return;
+        }
+        for (Class<?> c = target.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                if (!List.class.isAssignableFrom(f.getType()) && !Map.class.isAssignableFrom(f.getType())) {
+                    continue;
+                }
+                try {
+                    f.setAccessible(true);
+                    Object value = f.get(target);
+                    if (value instanceof List) {
+                        ((List<?>) value).remove(victim);
+                    } else if (value instanceof Map) {
+                        Iterator<?> it = ((Map<?, ?>) value).values().iterator();
+                        while (it.hasNext()) {
+                            if (it.next() == victim) {
+                                it.remove();
+                            }
                         }
-                    } catch (Exception ignored) {
-                        // immutable or inaccessible; not the field we need
                     }
+                } catch (Throwable ignored) {
+                    // immutable or inaccessible; not the field we need
                 }
             }
         }
@@ -281,7 +365,7 @@ final class Syncer {
                 Field f = c.getDeclaredField(name);
                 f.setAccessible(true);
                 return f.get(target);
-            } catch (Exception ignored) {
+            } catch (Throwable ignored) {
                 // try superclass
             }
         }
@@ -290,33 +374,56 @@ final class Syncer {
 
     // ----------------------------------------------------------------- misc
 
-    /** Tell the server and connected players about added / removed commands. */
+    /** Tell the server and connected players about added / removed commands (1.13+ only). */
     private void refreshCommands() {
         try {
             Object server = Bukkit.getServer();
             server.getClass().getMethod("syncCommands").invoke(server);
         } catch (Throwable ignored) {
-            // not available on this server build; tab-complete just won't refresh
+            // not available on this server build
         }
         for (Player player : Bukkit.getOnlinePlayers()) {
-            player.updateCommands();
+            try {
+                player.getClass().getMethod("updateCommands").invoke(player);
+            } catch (Throwable ignored) {
+                // pre-1.13: clients get no command tree to refresh
+            }
         }
     }
 
     @SuppressWarnings("deprecation")
     private static boolean dependsOn(Plugin q, Plugin p, boolean includeSoft) {
         try {
-            var desc = q.getDescription();
-            if (containsIgnoreCase(desc.getDepend(), p.getName())) {
+            if (containsIgnoreCase(q.getDescription().getDepend(), p.getName())) {
                 return true;
             }
-            return includeSoft && containsIgnoreCase(desc.getSoftDepend(), p.getName());
+            return includeSoft && containsIgnoreCase(q.getDescription().getSoftDepend(), p.getName());
         } catch (Throwable t) {
             return false;
         }
     }
 
+    /** Running version: getDescription() on most servers, getPluginMeta() if that is all there is. */
+    @SuppressWarnings("deprecation")
+    private static String versionOf(Plugin p) {
+        try {
+            return p.getDescription().getVersion();
+        } catch (Throwable ignored) {
+            // fall through
+        }
+        try {
+            Object meta = p.getClass().getMethod("getPluginMeta").invoke(p);
+            Class<?> metaType = Class.forName("io.papermc.paper.plugin.configuration.PluginMeta");
+            return String.valueOf(metaType.getMethod("getVersion").invoke(meta));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static boolean containsIgnoreCase(List<String> list, String name) {
+        if (list == null) {
+            return false;
+        }
         for (String s : list) {
             if (s.equalsIgnoreCase(name)) {
                 return true;
@@ -327,13 +434,13 @@ final class Syncer {
 
     /** Order jars so that anything a jar depends on (among the new jars) loads first. */
     private static List<JarInfo> order(List<JarInfo> jars) {
-        Map<String, JarInfo> byName = new LinkedHashMap<>();
+        Map<String, JarInfo> byName = new LinkedHashMap<String, JarInfo>();
         for (JarInfo j : jars) {
-            byName.put(lower(j.name()), j);
+            byName.put(lower(j.name), j);
         }
-        List<JarInfo> out = new ArrayList<>();
-        Set<String> done = new HashSet<>();
-        Set<String> visiting = new HashSet<>();
+        List<JarInfo> out = new ArrayList<JarInfo>();
+        Set<String> done = new HashSet<String>();
+        Set<String> visiting = new HashSet<String>();
         for (JarInfo j : jars) {
             visit(j, byName, done, visiting, out);
         }
@@ -342,11 +449,11 @@ final class Syncer {
 
     private static void visit(JarInfo j, Map<String, JarInfo> byName, Set<String> done,
                               Set<String> visiting, List<JarInfo> out) {
-        String key = lower(j.name());
+        String key = lower(j.name);
         if (done.contains(key) || !visiting.add(key)) {
             return;
         }
-        for (String dep : j.deps()) {
+        for (String dep : j.deps) {
             JarInfo d = byName.get(lower(dep));
             if (d != null) {
                 visit(d, byName, done, visiting, out);
@@ -359,11 +466,11 @@ final class Syncer {
 
     private static Path locationOf(Plugin p) {
         try {
-            var source = p.getClass().getProtectionDomain().getCodeSource();
+            java.security.CodeSource source = p.getClass().getProtectionDomain().getCodeSource();
             if (source == null) {
                 return null;
             }
-            return Path.of(source.getLocation().toURI()).toAbsolutePath().normalize();
+            return Paths.get(source.getLocation().toURI()).toAbsolutePath().normalize();
         } catch (Exception e) {
             return null;
         }

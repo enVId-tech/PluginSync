@@ -1,8 +1,10 @@
 name: PluginSync
 version: ${project.version}
 main: dev.etran.PluginSyncPlugin
-api-version: "1.21"
+# 1.8-1.12 servers ignore this key; 1.13+ servers use it to skip legacy-plugin mode.
+api-version: "1.13"
 description: Detects plugin jars added to or removed from the plugins folder and loads/unloads just those, without reloading anything else.
+author: PluginSync
 commands:
   pluginsync:
     description: Load newly added plugin jars and unload removed ones
