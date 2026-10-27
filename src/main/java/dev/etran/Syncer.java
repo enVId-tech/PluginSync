@@ -15,6 +15,7 @@ import java.io.FilenameFilter;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -40,10 +41,17 @@ final class Syncer {
     static final class Line {
         final ChatColor color;
         final String text;
+        /** Optional command (with leading slash) that a player can click to run. */
+        final String command;
 
         Line(ChatColor color, String text) {
+            this(color, text, null);
+        }
+
+        Line(ChatColor color, String text, String command) {
             this.color = color;
             this.text = text;
+            this.command = command;
         }
     }
 
@@ -51,15 +59,29 @@ final class Syncer {
         final List<JarInfo> toLoad;
         final List<Plugin> toUnload;
         final List<Line> notes;
+        /** Plugins that have more than one jar in the folder: plugin name -> candidate jars. */
+        final Map<String, List<JarInfo>> conflicts;
 
-        Plan(List<JarInfo> toLoad, List<Plugin> toUnload, List<Line> notes) {
+        Plan(List<JarInfo> toLoad, List<Plugin> toUnload, List<Line> notes,
+             Map<String, List<JarInfo>> conflicts) {
             this.toLoad = toLoad;
             this.toUnload = toUnload;
             this.notes = notes;
+            this.conflicts = conflicts;
         }
 
         boolean hasChanges() {
             return !toLoad.isEmpty() || !toUnload.isEmpty();
+        }
+
+        /** Candidate jars for a plugin name (case-insensitive), or null if it has no conflict. */
+        List<JarInfo> conflictsFor(String name) {
+            for (Map.Entry<String, List<JarInfo>> e : conflicts.entrySet()) {
+                if (e.getKey().equalsIgnoreCase(name)) {
+                    return e.getValue();
+                }
+            }
+            return null;
         }
     }
 
@@ -82,35 +104,37 @@ final class Syncer {
             ignore.add(lower(s));
         }
 
-        // Every plugin jar currently in the folder, keyed by the plugin name inside it.
-        Map<String, JarInfo> byName = new LinkedHashMap<String, JarInfo>();
-        File[] jars = dir.listFiles(new FilenameFilter() {
-            @Override
-            public boolean accept(File d, String n) {
-                return n.toLowerCase(Locale.ROOT).endsWith(".jar");
+        // Every plugin jar currently in the folder, grouped by the plugin name inside it.
+        Map<String, List<JarInfo>> groups = new LinkedHashMap<String, List<JarInfo>>();
+        for (JarInfo info : listJars(dir)) {
+            List<JarInfo> group = groups.get(lower(info.name));
+            if (group == null) {
+                group = new ArrayList<JarInfo>();
+                groups.put(lower(info.name), group);
             }
-        });
-        if (jars == null) {
-            jars = new File[0];
+            group.add(info);
         }
-        Arrays.sort(jars);
-        for (File jar : jars) {
-            JarInfo info = JarInfo.read(jar);
-            if (info == null) {
-                continue; // not a plugin (library jar, etc.)
+
+        // Plugins with several jars can't be handled automatically: the user has to pick one.
+        // Those are reported as conflicts and left alone by sync (a running plugin keeps running).
+        Map<String, List<JarInfo>> conflicts = new LinkedHashMap<String, List<JarInfo>>();
+        Map<String, JarInfo> byName = new LinkedHashMap<String, JarInfo>();
+        for (Map.Entry<String, List<JarInfo>> e : groups.entrySet()) {
+            List<JarInfo> group = e.getValue();
+            JarInfo first = group.get(0);
+            if (group.size() > 1 && !ignore.contains(e.getKey())) {
+                conflicts.put(first.name, group);
             }
-            JarInfo existing = byName.get(lower(info.name));
-            if (existing != null) {
-                notes.add(new Line(ChatColor.YELLOW, "Ignoring " + jar.getName()
-                        + ": same plugin name as " + existing.file.getName()));
-            } else {
-                byName.put(lower(info.name), info);
-            }
+            byName.put(e.getKey(), first); // used below to know a loaded plugin still has a jar
         }
 
         // New: a jar whose plugin isn't loaded.
         List<JarInfo> toLoad = new ArrayList<JarInfo>();
-        for (JarInfo info : byName.values()) {
+        for (Map.Entry<String, List<JarInfo>> e : groups.entrySet()) {
+            if (e.getValue().size() > 1) {
+                continue; // conflict, see above
+            }
+            JarInfo info = e.getValue().get(0);
             if (ignore.contains(lower(info.name))) {
                 continue;
             }
@@ -126,7 +150,8 @@ final class Syncer {
                 String running = versionOf(loaded);
                 if (running != null && !running.equals(info.version)) {
                     notes.add(new Line(ChatColor.YELLOW, info.name + ": jar is " + info.version
-                            + " but " + running + " is running (restart to update)"));
+                            + " but " + running + " is running. Switch with /pluginsync reload " + info.name,
+                            "/pluginsync reload " + info.name));
                 }
             }
         }
@@ -144,7 +169,140 @@ final class Syncer {
             toUnload.add(p);
         }
 
-        return new Plan(toLoad, toUnload, notes);
+        return new Plan(toLoad, toUnload, notes, conflicts);
+    }
+
+    /** Every readable plugin jar directly inside {@code dir}, sorted by file name. */
+    private static List<JarInfo> listJars(File dir) {
+        File[] jars = dir.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File d, String n) {
+                return n.toLowerCase(Locale.ROOT).endsWith(".jar");
+            }
+        });
+        List<JarInfo> out = new ArrayList<JarInfo>();
+        if (jars == null) {
+            return out;
+        }
+        Arrays.sort(jars);
+        for (File jar : jars) {
+            JarInfo info = JarInfo.read(jar);
+            if (info != null) {
+                out.add(info);   // jars with no plugin.yml (libraries etc.) are skipped
+            }
+        }
+        return out;
+    }
+
+    // ------------------------------------------------- choosing between jars
+
+    /** Which candidate jar the running plugin was loaded from, or null if that can't be told. */
+    JarInfo runningJar(Plugin running, List<JarInfo> candidates) {
+        Path location = locationOf(running);
+        if (location != null) {
+            for (JarInfo j : candidates) {
+                if (j.file.toPath().toAbsolutePath().normalize().equals(location)) {
+                    return j;
+                }
+            }
+        }
+        // Paper may run a remapped copy from a different path; fall back to matching the version.
+        String version = versionOf(running);
+        if (version != null) {
+            JarInfo match = null;
+            int count = 0;
+            for (JarInfo j : candidates) {
+                if (version.equals(j.version)) {
+                    match = j;
+                    count++;
+                }
+            }
+            if (count == 1) {
+                return match;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Make {@code chosen} the jar that is used for its plugin: swap it in if another version is
+     * running, load it if nothing is running, and (optionally) move the other jars out of the way
+     * so the server doesn't hit "ambiguous plugin name" on the next restart.
+     */
+    List<Line> choose(JarInfo chosen, List<JarInfo> candidates, boolean force) {
+        List<Line> out = new ArrayList<Line>();
+        PluginManager pm = Bukkit.getPluginManager();
+
+        if (chosen.paperOnly) {
+            out.add(new Line(ChatColor.RED, chosen.file.getName()
+                    + " only has a paper-plugin.yml and can't be loaded at runtime; restart needed"));
+            return out;
+        }
+
+        Plugin running = pm.getPlugin(chosen.name);
+        boolean ok;
+        if (running == null) {
+            ok = loadAndCheck(chosen, out);
+        } else if (runningJar(running, candidates) == chosen) {
+            out.add(new Line(ChatColor.GREEN, "Keeping " + chosen.name + " " + chosen.version
+                    + " (" + chosen.file.getName() + ") as it is already running"));
+            ok = true;
+        } else {
+            List<String> dependents = enabledDependents(running);
+            if (!dependents.isEmpty() && !force) {
+                out.add(blockedBy(running, dependents));
+                return out;
+            }
+            try {
+                unload(running);
+                out.add(new Line(ChatColor.GOLD, "Unloaded " + running.getName()));
+            } catch (Throwable t) {
+                self.getLogger().log(Level.WARNING, "Failed to unload " + running.getName(), t);
+                out.add(new Line(ChatColor.RED, "Failed to unload " + running.getName() + ": " + describe(t)));
+                return out;
+            }
+            ok = loadAndCheck(chosen, out);
+            refreshCommands();
+            if (!dependents.isEmpty()) {
+                out.add(forcedWarning(dependents));
+            }
+        }
+
+        if (ok && self.getConfig().getBoolean("archive-unchosen", true)) {
+            archiveOthers(chosen, candidates, out);
+        }
+        return out;
+    }
+
+    private boolean loadAndCheck(JarInfo jar, List<Line> out) {
+        loadJar(jar, out);
+        refreshCommands();
+        Plugin now = Bukkit.getPluginManager().getPlugin(jar.name);
+        return now != null && now.isEnabled();
+    }
+
+    /** Move the jars that were not chosen into plugins/PluginSync/archived/ (never deletes). */
+    private void archiveOthers(JarInfo chosen, List<JarInfo> candidates, List<Line> out) {
+        File archive = new File(self.getDataFolder(), "archived");
+        for (JarInfo other : candidates) {
+            if (other == chosen) {
+                continue;
+            }
+            try {
+                Files.createDirectories(archive.toPath());
+                Path target = new File(archive, other.file.getName()).toPath();
+                if (Files.exists(target)) {
+                    target = new File(archive, System.currentTimeMillis() + "-" + other.file.getName()).toPath();
+                }
+                Files.move(other.file.toPath(), target);
+                out.add(new Line(ChatColor.GRAY, "Moved " + other.file.getName()
+                        + " to plugins/PluginSync/archived/ (set archive-unchosen: false to keep unused jars in place)"));
+            } catch (Throwable t) {
+                self.getLogger().log(Level.WARNING, "Could not move " + other.file.getName(), t);
+                out.add(new Line(ChatColor.YELLOW, "Couldn't move " + other.file.getName() + " (" + describe(t)
+                        + "); remove it by hand or the server will complain about it on restart"));
+            }
+        }
     }
 
     // ----------------------------------------------------------------- apply
@@ -319,12 +477,19 @@ final class Syncer {
             out.add(blockedBy(p, dependents));
             return out;
         }
-        JarInfo jar = findJar(p.getName());
-        if (jar == null) {
+        List<JarInfo> jars = findJars(p.getName());
+        if (jars.isEmpty()) {
             out.add(new Line(ChatColor.RED, "Can't reload " + p.getName()
                     + ": no jar with that plugin name in the plugins folder"));
             return out;
         }
+        if (jars.size() > 1) {
+            out.add(new Line(ChatColor.YELLOW, "There are " + jars.size() + " jars for " + p.getName()
+                    + ". Pick which one to use with /pluginsync choose " + p.getName(),
+                    "/pluginsync choose " + p.getName()));
+            return out;
+        }
+        JarInfo jar = jars.get(0);
         if (jar.paperOnly) {
             out.add(new Line(ChatColor.RED, "Can't reload " + p.getName()
                     + ": its jar only has a paper-plugin.yml, which can't be loaded at runtime"));
@@ -377,26 +542,16 @@ final class Syncer {
         return sb.toString();
     }
 
-    /** The jar in the plugins folder whose plugin.yml name matches, or null. */
-    private JarInfo findJar(String pluginName) {
+    /** Every jar in the plugins folder whose plugin.yml name matches. */
+    private List<JarInfo> findJars(String pluginName) {
         File dir = self.getDataFolder().getAbsoluteFile().getParentFile();
-        File[] jars = dir.listFiles(new FilenameFilter() {
-            @Override
-            public boolean accept(File d, String n) {
-                return n.toLowerCase(Locale.ROOT).endsWith(".jar");
-            }
-        });
-        if (jars == null) {
-            return null;
-        }
-        Arrays.sort(jars);
-        for (File jar : jars) {
-            JarInfo info = JarInfo.read(jar);
-            if (info != null && info.name.equalsIgnoreCase(pluginName)) {
-                return info;
+        List<JarInfo> matches = new ArrayList<JarInfo>();
+        for (JarInfo info : listJars(dir)) {
+            if (info.name.equalsIgnoreCase(pluginName)) {
+                matches.add(info);
             }
         }
-        return null;
+        return matches;
     }
 
     // ---------------------------------------------------------------- unload
@@ -569,7 +724,7 @@ final class Syncer {
 
     /** Running version: getDescription() on most servers, getPluginMeta() if that is all there is. */
     @SuppressWarnings("deprecation")
-    private static String versionOf(Plugin p) {
+    static String versionOf(Plugin p) {
         try {
             return p.getDescription().getVersion();
         } catch (Throwable ignored) {

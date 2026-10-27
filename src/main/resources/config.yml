@@ -3,3 +3,8 @@ ignore: []
 # Example:
 # ignore:
 #   - SomeFragilePlugin
+
+# When there are several jars of one plugin and you choose one with /pluginsync choose,
+# move the others into plugins/PluginSync/archived/ (nothing is ever deleted). Otherwise the
+# server complains about the duplicate plugin name on its next restart.
+archive-unchosen: true

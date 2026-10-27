@@ -7,6 +7,7 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.command.TabExecutor;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -14,18 +15,23 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
 
-    private static final List<String> SUBCOMMANDS = Arrays.asList("scan", "sync", "enable", "disable", "restart", "reload");
+    private static final List<String> SUBCOMMANDS =
+            Arrays.asList("scan", "sync", "choose", "enable", "disable", "restart", "reload");
     private static final List<String> PLUGIN_ACTIONS = Arrays.asList("enable", "disable", "restart", "reload");
 
     private Syncer syncer;
+    private ChoiceMenu menu;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         syncer = new Syncer(this);
+        menu = new ChoiceMenu(this);
+        getServer().getPluginManager().registerEvents(menu, this);
         PluginCommand command = getCommand("pluginsync");
         if (command != null) {
             command.setExecutor(this);
@@ -44,7 +50,9 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         if (sub.equals("scan")) {
             scan(sender, label);
         } else if (sub.equals("sync")) {
-            sync(sender);
+            sync(sender, label);
+        } else if (sub.equals("choose")) {
+            choose(sender, label, args);
         } else if (PLUGIN_ACTIONS.contains(sub)) {
             pluginAction(sender, label, sub, args);
         } else {
@@ -53,11 +61,13 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         return true;
     }
 
+    // ------------------------------------------------------------ scan / sync
+
     private void scan(CommandSender sender, String label) {
         reloadConfig();
         Syncer.Plan plan = syncer.scan();
         if (!plan.hasChanges()) {
-            send(sender, ChatColor.GREEN, "Nothing to do: the plugins folder matches what's loaded.");
+            send(sender, ChatColor.GREEN, "Nothing to load or unload: the plugins folder matches what's loaded.");
         } else {
             if (!plan.toLoad.isEmpty()) {
                 List<String> names = new ArrayList<String>();
@@ -75,25 +85,156 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
             }
             send(sender, ChatColor.GRAY, "Run /" + label + " to apply.");
         }
+        printConflicts(sender, label, plan);
         for (Syncer.Line line : plan.notes) {
-            send(sender, line.color, line.text);
+            send(sender, line);
         }
     }
 
-    private void sync(CommandSender sender) {
+    private void sync(CommandSender sender, String label) {
         reloadConfig();
         Syncer.Plan plan = syncer.scan();
         if (!plan.hasChanges()) {
-            send(sender, ChatColor.GREEN, "Nothing to do: the plugins folder matches what's loaded.");
+            send(sender, ChatColor.GREEN, "Nothing to load or unload: the plugins folder matches what's loaded.");
+            printConflicts(sender, label, plan);
             for (Syncer.Line line : plan.notes) {
-                send(sender, line.color, line.text);
+                send(sender, line);
             }
             return;
         }
         for (Syncer.Line line : syncer.apply(plan)) {
-            send(sender, line.color, line.text);
+            send(sender, line);
+        }
+        printConflicts(sender, label, plan);
+    }
+
+    /** One line per plugin that has several jars, clickable for players. */
+    private void printConflicts(CommandSender sender, String label, Syncer.Plan plan) {
+        for (Map.Entry<String, List<JarInfo>> e : plan.conflicts.entrySet()) {
+            List<String> described = new ArrayList<String>();
+            for (JarInfo j : e.getValue()) {
+                described.add(j.file.getName() + " (" + j.version + ")");
+            }
+            send(sender, new Syncer.Line(ChatColor.YELLOW,
+                    "Multiple jars for " + e.getKey() + ": " + join(described)
+                            + ". Choose one: /" + label + " choose " + e.getKey(),
+                    "/" + label + " choose " + e.getKey()));
         }
     }
+
+    // ----------------------------------------------------------------- choose
+
+    /** /pluginsync choose [plugin] [number|gui] [-f] */
+    private void choose(CommandSender sender, String label, String[] args) {
+        boolean force = false;
+        List<String> tokens = new ArrayList<String>();
+        for (int i = 1; i < args.length; i++) {
+            if (args[i].equalsIgnoreCase("-f") || args[i].equalsIgnoreCase("--force")) {
+                force = true;
+            } else {
+                tokens.add(args[i]);
+            }
+        }
+
+        reloadConfig();
+        Syncer.Plan plan = syncer.scan();
+
+        if (tokens.isEmpty()) {
+            if (plan.conflicts.isEmpty()) {
+                send(sender, ChatColor.GREEN, "No plugin has more than one jar in the plugins folder right now.");
+            }
+            for (Map.Entry<String, List<JarInfo>> e : plan.conflicts.entrySet()) {
+                showOptions(sender, label, e.getKey(), e.getValue());
+            }
+            return;
+        }
+
+        List<JarInfo> candidates = plan.conflictsFor(tokens.get(0));
+        if (candidates == null) {
+            send(sender, ChatColor.RED, "There's only one jar (or none) for " + tokens.get(0)
+                    + ". To re-read a replaced jar use /" + label + " reload " + tokens.get(0) + ".");
+            return;
+        }
+        String name = candidates.get(0).name;
+
+        if (tokens.size() == 1) {
+            showOptions(sender, label, name, candidates);
+            return;
+        }
+
+        String pick = tokens.get(1);
+        if (pick.equalsIgnoreCase("gui")) {
+            if (!(sender instanceof Player)) {
+                send(sender, ChatColor.RED, "The menu is only for players. Use a number instead: /"
+                        + label + " choose " + name + " <number>");
+                return;
+            }
+            Plugin running = Bukkit.getPluginManager().getPlugin(name);
+            JarInfo runningJar = running == null ? null : syncer.runningJar(running, candidates);
+            menu.open((Player) sender, name, candidates, runningJar);
+            return;
+        }
+
+        int index;
+        try {
+            index = Integer.parseInt(pick);
+        } catch (NumberFormatException e) {
+            send(sender, ChatColor.YELLOW, "Usage: /" + label + " choose " + name + " <number|gui> [-f]");
+            return;
+        }
+        if (index < 1 || index > candidates.size()) {
+            send(sender, ChatColor.RED, "Pick a number between 1 and " + candidates.size() + ".");
+            return;
+        }
+        applyChoice(sender, name, candidates.get(index - 1), force);
+    }
+
+    private void showOptions(CommandSender sender, String label, String name, List<JarInfo> candidates) {
+        Plugin running = Bukkit.getPluginManager().getPlugin(name);
+        JarInfo runningJar = running == null ? null : syncer.runningJar(running, candidates);
+        String state = running == null ? "not loaded"
+                : "running " + String.valueOf(Syncer.versionOf(running));
+        send(sender, ChatColor.AQUA, "Multiple jars for " + name + " (" + state + "):");
+        for (int i = 0; i < candidates.size(); i++) {
+            JarInfo j = candidates.get(i);
+            boolean isRunning = j == runningJar;
+            send(sender, new Syncer.Line(isRunning ? ChatColor.YELLOW : ChatColor.GREEN,
+                    "  [" + (i + 1) + "] " + j.file.getName() + "  v" + j.version + (isRunning ? "  (running)" : ""),
+                    "/" + label + " choose " + name + " " + (i + 1)));
+        }
+        if (sender instanceof Player) {
+            send(sender, new Syncer.Line(ChatColor.AQUA, "  [Open menu]", "/" + label + " choose " + name + " gui"));
+        }
+        send(sender, ChatColor.GRAY, "Click a line, or run /" + label + " choose " + name
+                + " <number>. Add -f if other plugins depend on it.");
+    }
+
+    /** Re-checks the folder (it may have changed since the list was shown), then applies the pick. */
+    void applyChoice(CommandSender sender, String name, JarInfo requested, boolean force) {
+        Syncer.Plan plan = syncer.scan();
+        List<JarInfo> candidates = plan.conflictsFor(name);
+        if (candidates == null) {
+            send(sender, ChatColor.RED, "There's no longer more than one jar for " + name
+                    + ". Use /pluginsync reload " + name + " to re-read its jar.");
+            return;
+        }
+        JarInfo chosen = null;
+        for (JarInfo j : candidates) {
+            if (j.file.getAbsoluteFile().equals(requested.file.getAbsoluteFile())) {
+                chosen = j;
+                break;
+            }
+        }
+        if (chosen == null) {
+            send(sender, ChatColor.RED, requested.file.getName() + " is no longer in the plugins folder.");
+            return;
+        }
+        for (Syncer.Line line : syncer.choose(chosen, candidates, force)) {
+            send(sender, line);
+        }
+    }
+
+    // --------------------------------------------- enable/disable/restart/reload
 
     /** /pluginsync enable|disable|restart|reload &lt;plugin&gt; [-f] */
     private void pluginAction(CommandSender sender, String label, String action, String[] args) {
@@ -133,19 +274,22 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
             lines = syncer.reload(target, force);
         }
         for (Syncer.Line line : lines) {
-            send(sender, line.color, line.text);
+            send(sender, line);
         }
     }
 
     private void usage(CommandSender sender, String label) {
         send(sender, ChatColor.YELLOW, "/" + label + "                     load new jars, unload removed ones");
         send(sender, ChatColor.YELLOW, "/" + label + " scan               preview what a sync would do");
+        send(sender, ChatColor.YELLOW, "/" + label + " choose [plugin]    pick between several jars of one plugin");
         send(sender, ChatColor.YELLOW, "/" + label + " enable <plugin>    turn a disabled plugin on");
         send(sender, ChatColor.YELLOW, "/" + label + " disable <plugin>   turn a plugin off");
         send(sender, ChatColor.YELLOW, "/" + label + " restart <plugin>   disable, then enable");
         send(sender, ChatColor.YELLOW, "/" + label + " reload <plugin>    unload and load again from its jar");
-        send(sender, ChatColor.GRAY, "Add -f to disable/restart/reload even if other plugins depend on it.");
+        send(sender, ChatColor.GRAY, "Add -f to act even if other plugins depend on the target.");
     }
+
+    // ---------------------------------------------------------- tab completion
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
@@ -153,9 +297,10 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         if (!sender.hasPermission("pluginsync.use")) {
             return out;
         }
+        String first = args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "";
         if (args.length == 1) {
             addMatches(out, SUBCOMMANDS, args[0]);
-        } else if (args.length == 2 && PLUGIN_ACTIONS.contains(args[0].toLowerCase(Locale.ROOT))) {
+        } else if (args.length == 2 && PLUGIN_ACTIONS.contains(first)) {
             List<String> names = new ArrayList<String>();
             for (Plugin p : Bukkit.getPluginManager().getPlugins()) {
                 if (p != this) {
@@ -163,8 +308,25 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
                 }
             }
             addMatches(out, names, args[1]);
-        } else if (args.length == 3 && PLUGIN_ACTIONS.contains(args[0].toLowerCase(Locale.ROOT))) {
+        } else if (args.length == 3 && PLUGIN_ACTIONS.contains(first)) {
             addMatches(out, Arrays.asList("-f"), args[2]);
+        } else if (first.equals("choose")) {
+            Syncer.Plan plan = syncer.scan();
+            if (args.length == 2) {
+                addMatches(out, new ArrayList<String>(plan.conflicts.keySet()), args[1]);
+            } else if (args.length == 3) {
+                List<JarInfo> candidates = plan.conflictsFor(args[1]);
+                List<String> options = new ArrayList<String>();
+                options.add("gui");
+                if (candidates != null) {
+                    for (int i = 1; i <= candidates.size(); i++) {
+                        options.add(String.valueOf(i));
+                    }
+                }
+                addMatches(out, options, args[2]);
+            } else if (args.length == 4) {
+                addMatches(out, Arrays.asList("-f"), args[3]);
+            }
         }
         return out;
     }
@@ -178,10 +340,23 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         }
     }
 
+    // ---------------------------------------------------------------- messages
+
     private void send(CommandSender sender, ChatColor color, String text) {
-        sender.sendMessage(color + text);
+        send(sender, new Syncer.Line(color, text));
+    }
+
+    private void send(CommandSender sender, Syncer.Line line) {
+        String legacy = line.color + line.text;
+        boolean sent = false;
+        if (line.command != null && sender instanceof Player) {
+            sent = Chat.sendClickable((Player) sender, legacy, line.command);
+        }
+        if (!sent) {
+            sender.sendMessage(legacy);
+        }
         if (!(sender instanceof ConsoleCommandSender)) {
-            getLogger().info("[" + sender.getName() + "] " + text);
+            getLogger().info("[" + sender.getName() + "] " + line.text);
         }
     }
 
