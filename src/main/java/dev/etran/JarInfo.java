@@ -19,13 +19,38 @@ final class JarInfo {
     final String version;
     final List<String> deps;
     final boolean paperOnly;
+    /** The "main:" class from plugin.yml, or null. */
+    final String main;
 
-    private JarInfo(File file, String name, String version, List<String> deps, boolean paperOnly) {
+    private JarInfo(File file, String name, String version, List<String> deps, boolean paperOnly, String main) {
         this.file = file;
         this.name = name;
         this.version = version;
         this.deps = deps;
         this.paperOnly = paperOnly;
+        this.main = main;
+    }
+
+    /** True if the jar really contains the class named by "main:" (a cheap sanity check). */
+    boolean hasMainClass() {
+        if (main == null || main.trim().isEmpty()) {
+            return false;
+        }
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(file);
+            return zip.getEntry(main.trim().replace('.', '/') + ".class") != null;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (zip != null) {
+                try {
+                    zip.close();
+                } catch (Exception ignored) {
+                    // nothing useful to do
+                }
+            }
+        }
     }
 
     /** Returns null if the jar has no plugin.yml / paper-plugin.yml or can't be read. */
@@ -54,7 +79,8 @@ final class JarInfo {
                     deps.addAll(yaml.getStringList("depend"));
                     deps.addAll(yaml.getStringList("softdepend"));
                 }
-                return new JarInfo(file, name.trim(), String.valueOf(yaml.get("version", "?")), deps, paperOnly);
+                return new JarInfo(file, name.trim(), String.valueOf(yaml.get("version", "?")), deps, paperOnly,
+                        yaml.getString("main"));
             } finally {
                 reader.close();
             }

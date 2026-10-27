@@ -6,6 +6,7 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandMap;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.PluginManager;
 
@@ -247,6 +248,8 @@ final class Syncer {
             out.add(new Line(ChatColor.GREEN, "Keeping " + chosen.name + " " + chosen.version
                     + " (" + chosen.file.getName() + ") as it is already running"));
             ok = true;
+        } else if (running == self) {
+            ok = selfReload(chosen, out);
         } else {
             List<String> dependents = enabledDependents(running);
             if (!dependents.isEmpty() && !force) {
@@ -483,6 +486,9 @@ final class Syncer {
     /** Unload the plugin and load it again from its jar, so a replaced jar takes effect. */
     List<Line> reload(Plugin p, boolean force) {
         List<Line> out = new ArrayList<Line>();
+        if (p == self) {
+            return updateSelf();
+        }
         List<String> dependents = enabledDependents(p);
         if (!dependents.isEmpty() && !force) {
             out.add(blockedBy(p, dependents));
@@ -564,9 +570,126 @@ final class Syncer {
         return matches;
     }
 
+    // ------------------------------------------------------------- self update
+
+    /**
+     * /pluginsync update and /pluginsync reload PluginSync: switch PluginSync to its newest jar.
+     * With several PluginSync jars in the folder the most recently modified one is used.
+     */
+    List<Line> updateSelf() {
+        List<Line> out = new ArrayList<Line>();
+        List<JarInfo> jars = findJars(self.getName());
+        if (jars.isEmpty()) {
+            out.add(new Line(ChatColor.RED, "Can't find a " + self.getName() + " jar in the plugins folder"));
+            return out;
+        }
+        JarInfo newest = jars.get(0);
+        for (JarInfo j : jars) {
+            if (j.file.lastModified() > newest.file.lastModified()) {
+                newest = j;
+            }
+        }
+        if (jars.size() > 1) {
+            out.add(new Line(ChatColor.GRAY, "Several " + self.getName()
+                    + " jars found; using the most recently modified: " + newest.file.getName()));
+            out.addAll(choose(newest, jars, false));
+        } else {
+            selfReload(newest, out);
+        }
+        return out;
+    }
+
+    /**
+     * Replace the running PluginSync with {@code target}. This is delicate because the code doing
+     * the work belongs to the plugin being replaced, so:
+     * all of this plugin's classes were loaded when it started (see PluginSyncPlugin), the old
+     * class loader is only closed at the very end, and if the new jar fails to load the previous
+     * version is loaded again.
+     */
+    private boolean selfReload(JarInfo target, List<Line> out) {
+        PluginManager pm = Bukkit.getPluginManager();
+        String name = self.getName();
+
+        if (target.paperOnly || !target.hasMainClass()) {
+            out.add(new Line(ChatColor.RED, target.file.getName()
+                    + " doesn't look like a loadable plugin jar (main class missing); keeping the current version"));
+            return false;
+        }
+
+        String oldVersion = versionOf(self);
+        JarInfo fallback = null;
+        for (JarInfo j : findJars(name)) {
+            if (!j.file.equals(target.file) && oldVersion != null && oldVersion.equals(j.version)) {
+                fallback = j;
+            }
+        }
+
+        out.add(new Line(ChatColor.GOLD, "Reloading " + name + " (" + oldVersion + " -> " + target.version + ")"));
+        closeOpenMenus();
+
+        ClassLoader oldLoader;
+        try {
+            oldLoader = unload(self, false);
+        } catch (Throwable t) {
+            self.getLogger().log(Level.WARNING, "Failed to unload " + name + " for self-update", t);
+            out.add(new Line(ChatColor.RED, "Failed to unload " + name + ": " + describe(t)));
+            return false;
+        }
+
+        loadJar(target, out);
+        Plugin now = pm.getPlugin(name);
+        boolean ok = now != null && now.isEnabled();
+        if (!ok && fallback != null) {
+            out.add(new Line(ChatColor.YELLOW, "The new jar didn't load; restoring the previous version ("
+                    + fallback.file.getName() + ")"));
+            loadJar(fallback, out);
+            now = pm.getPlugin(name);
+        }
+        refreshCommands();
+
+        if (oldLoader instanceof Closeable) {
+            try {
+                ((Closeable) oldLoader).close();
+            } catch (Throwable ignored) {
+                // the old jar just stays open until restart
+            }
+        }
+        if (now == null || !now.isEnabled()) {
+            out.add(new Line(ChatColor.RED, name + " is not loaded right now. Put a working " + name
+                    + " jar in the plugins folder and restart the server."));
+        }
+        return ok;
+    }
+
+    /** Close any open choice menu: its listener belongs to the version that is going away. */
+    private static void closeOpenMenus() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            try {
+                // InventoryView is a class on old servers and an interface on new ones, so reflect.
+                Object view = player.getClass().getMethod("getOpenInventory").invoke(player);
+                Object top = Class.forName("org.bukkit.inventory.InventoryView")
+                        .getMethod("getTopInventory").invoke(view);
+                if (top instanceof Inventory && ((Inventory) top).getHolder() instanceof ChoiceMenu.Holder) {
+                    player.closeInventory();
+                }
+            } catch (Throwable ignored) {
+                // best effort
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- unload
 
     private void unload(Plugin plugin) throws Exception {
+        unload(plugin, true);
+    }
+
+    /**
+     * Fully forgets a plugin. With {@code closeLoader} false the plugin's class loader is left
+     * open and returned, so the caller can close it later (used when PluginSync replaces itself:
+     * its own code must keep working until the new version is in).
+     */
+    private ClassLoader unload(Plugin plugin, boolean closeLoader) throws Exception {
         PluginManager pm = Bukkit.getPluginManager();
         ClassLoader loader = plugin.getClass().getClassLoader();
         Object pluginLoader = null;
@@ -593,9 +716,10 @@ final class Syncer {
             self.getLogger().info("Cleared " + cleared + " Paper registry entries for " + plugin.getName());
         }
 
-        if (loader instanceof Closeable) {
+        if (closeLoader && loader instanceof Closeable) {
             ((Closeable) loader).close();  // releases the jar file (matters on Windows)
         }
+        return loader;
     }
 
     private void cleanup(Plugin plugin) {

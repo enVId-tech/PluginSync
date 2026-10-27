@@ -8,7 +8,7 @@ author: PluginSync
 commands:
   pluginsync:
     description: Sync plugin jars with the server, or enable/disable/restart/reload one plugin
-    usage: /<command> [scan|sync|choose|enable|disable|restart|reload] [plugin] [-f]
+    usage: /<command> [scan|sync|choose|update|enable|disable|restart|reload] [plugin] [-f]
     aliases: [psync]
     permission: pluginsync.use
 permissions:

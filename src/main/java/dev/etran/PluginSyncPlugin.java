@@ -11,16 +11,20 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
 
     private static final List<String> SUBCOMMANDS =
-            Arrays.asList("scan", "sync", "choose", "enable", "disable", "restart", "reload");
+            Arrays.asList("scan", "sync", "choose", "update", "enable", "disable", "restart", "reload");
     private static final List<String> PLUGIN_ACTIONS = Arrays.asList("enable", "disable", "restart", "reload");
 
     private Syncer syncer;
@@ -28,6 +32,10 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
 
     @Override
     public void onEnable() {
+        // Load every class of this jar now. Self-update replaces this plugin while its own code is
+        // running, and the jar on disk may already have been overwritten by then; classes that are
+        // already in memory keep working either way.
+        preloadOwnClasses();
         saveDefaultConfig();
         syncer = new Syncer(this);
         menu = new ChoiceMenu(this);
@@ -53,6 +61,10 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
             sync(sender, label);
         } else if (sub.equals("choose")) {
             choose(sender, label, args);
+        } else if (sub.equals("update")) {
+            for (Syncer.Line line : syncer.updateSelf()) {
+                send(sender, line);
+            }
         } else if (PLUGIN_ACTIONS.contains(sub)) {
             pluginAction(sender, label, sub, args);
         } else {
@@ -258,8 +270,9 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
                     + ". If you just added its jar, run /" + label + " first.");
             return;
         }
-        if (target == this) {
-            send(sender, ChatColor.RED, "PluginSync can't " + action + " itself.");
+        if (target == this && !action.equals("reload")) {
+            send(sender, ChatColor.RED, "PluginSync can't " + action + " itself. "
+                    + "(/" + label + " reload PluginSync or /" + label + " update switch it to its newest jar.)");
             return;
         }
 
@@ -286,6 +299,7 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         send(sender, ChatColor.YELLOW, "/" + label + " disable <plugin>   turn a plugin off");
         send(sender, ChatColor.YELLOW, "/" + label + " restart <plugin>   disable, then enable");
         send(sender, ChatColor.YELLOW, "/" + label + " reload <plugin>    unload and load again from its jar");
+        send(sender, ChatColor.YELLOW, "/" + label + " update             switch PluginSync itself to its newest jar");
         send(sender, ChatColor.GRAY, "Add -f to act even if other plugins depend on the target.");
     }
 
@@ -303,7 +317,7 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
         } else if (args.length == 2 && PLUGIN_ACTIONS.contains(first)) {
             List<String> names = new ArrayList<String>();
             for (Plugin p : Bukkit.getPluginManager().getPlugins()) {
-                if (p != this) {
+                if (p != this || first.equals("reload")) {
                     names.add(p.getName());
                 }
             }
@@ -337,6 +351,38 @@ public final class PluginSyncPlugin extends JavaPlugin implements TabExecutor {
             if (s.toLowerCase(Locale.ROOT).startsWith(prefix)) {
                 out.add(s);
             }
+        }
+    }
+
+    private void preloadOwnClasses() {
+        try {
+            java.security.CodeSource source = getClass().getProtectionDomain().getCodeSource();
+            if (source == null) {
+                return;
+            }
+            File file = new File(source.getLocation().toURI());
+            if (!file.isFile()) {
+                return;
+            }
+            ClassLoader loader = getClass().getClassLoader();
+            JarFile jar = new JarFile(file);
+            try {
+                Enumeration<JarEntry> entries = jar.entries();
+                while (entries.hasMoreElements()) {
+                    String entry = entries.nextElement().getName();
+                    if (entry.endsWith(".class")) {
+                        try {
+                            Class.forName(entry.substring(0, entry.length() - 6).replace('/', '.'), false, loader);
+                        } catch (Throwable ignored) {
+                            // best effort
+                        }
+                    }
+                }
+            } finally {
+                jar.close();
+            }
+        } catch (Throwable ignored) {
+            // best effort: self-update then relies on lazy class loading
         }
     }
 
