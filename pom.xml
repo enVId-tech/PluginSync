@@ -6,12 +6,13 @@
 
     <groupId>dev.etran</groupId>
     <artifactId>PluginSync</artifactId>
-    <version>1.4.0</version>
+    <version>1.5.0</version>
     <packaging>jar</packaging>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <!-- Compiled against the oldest API we support (1.8.8) on Java 8 bytecode, so the same jar
+        <kotlin.version>2.2.21</kotlin.version>
+        <!-- Compiled against the oldest API we support (1.8.8) as Java 8 bytecode, so the same jar
              loads on every newer server. Anything newer than 1.8 is reached through reflection. -->
         <java.release>8</java.release>
     </properties>
@@ -30,10 +31,21 @@
             <version>1.8.8-R0.1-SNAPSHOT</version>
             <scope>provided</scope>
             <exclusions>
-                <!-- Only needed for the Spigot chat-component API, which PluginSync doesn't use. -->
+                <!-- Only needed for the Spigot chat-component API, which PluginSync reaches by reflection. -->
                 <exclusion>
                     <groupId>net.md-5</groupId>
                     <artifactId>bungeecord-chat</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>${kotlin.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.jetbrains</groupId>
+                    <artifactId>annotations</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
@@ -41,6 +53,7 @@
 
     <build>
         <finalName>${project.artifactId}-${project.version}</finalName>
+        <sourceDirectory>src/main/kotlin</sourceDirectory>
         <resources>
             <resource>
                 <directory>src/main/resources</directory>
@@ -49,12 +62,71 @@
         </resources>
         <plugins>
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-maven-plugin</artifactId>
+                <version>${kotlin.version}</version>
+                <executions>
+                    <execution>
+                        <id>compile</id>
+                        <phase>compile</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
                 <configuration>
-                    <release>${java.release}</release>
+                    <jvmTarget>1.8</jvmTarget>
+                    <args>
+                        <!-- Compile lambdas / SAM conversions to real classes instead of invokedynamic, so
+                             every class is in the jar and gets preloaded (needed for self-update). -->
+                        <arg>-Xlambdas=class</arg>
+                        <arg>-Xsam-conversions=class</arg>
+                        <!-- Bukkit is Java; don't add null-assertions that can throw on platform types. -->
+                        <arg>-Xno-param-assertions</arg>
+                        <arg>-Xno-call-assertions</arg>
+                        <arg>-Xno-receiver-assertions</arg>
+                    </args>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!-- Only keep the parts of the Kotlin runtime that are actually used. -->
+                            <minimizeJar>true</minimizeJar>
+                            <relocations>
+                                <!-- Other plugins may bundle their own Kotlin; keep ours private. -->
+                                <relocation>
+                                    <pattern>kotlin</pattern>
+                                    <shadedPattern>dev.etran.libs.kotlin</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/versions/**</exclude>
+                                        <exclude>META-INF/maven/**</exclude>
+                                        <exclude>META-INF/*.kotlin_module</exclude>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>DebugProbesKt.bin</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

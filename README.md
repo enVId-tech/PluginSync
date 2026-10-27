@@ -3,7 +3,7 @@
 Detects plugin jars added to or removed from `plugins/` and loads or unloads just those; lets you pick between several versions of the same plugin; and lets you enable, disable, restart or reload one specific plugin. Plugins you don't name are never touched.
 
 ## Install
-Drop `PluginSync-1.4.0.jar` into `plugins/` and restart once.
+Drop `PluginSync-1.5.0.jar` into `plugins/` and restart once.
 
 ## Commands
 Permission for all of them: `pluginsync.use` (default: op). They work from the console too. Alias: `/psync`.
@@ -30,7 +30,7 @@ Drop a newer PluginSync jar into `plugins/` (either next to the old one or overw
 - If the new jar fails to load, the previous version is loaded again from its jar, if it is still in the folder.
 - All of PluginSync's classes are loaded into memory when it starts, so it keeps working even if its jar is overwritten on disk mid-update. The old class loader is only closed once the new version is running.
 
-This needs a PluginSync that already contains the feature (1.4.0 or newer), so the first time you have to restart the server once to get there. `/pluginsync choose PluginSync` and `/pluginsync scan` also understand the situation.
+This needs a PluginSync that already contains the feature (1.4.0 or newer; 1.5.0 is the Kotlin port with identical behaviour), so the first time you have to restart the server once to get there. `/pluginsync choose PluginSync` and `/pluginsync scan` also understand the situation.
 
 ## Several versions of one plugin
 If two or more jars in `plugins/` have the same plugin name (for example `Foo-1.0.jar` and `Foo-1.1.jar`), `/pluginsync` does not guess. It leaves a running plugin running, skips loading that plugin, and prints a line like `Multiple jars for Foo: ...` that players can click. Then:
@@ -43,19 +43,20 @@ A single jar whose version differs from the running one is only reported by `sca
 
 ## Compatibility
 Targets Bukkit/Spigot/Paper/Purpur from 1.8 through 26.x with a single jar:
-- Compiled against the Spigot 1.8.8 API as Java 8 bytecode, so it runs on any Java the server itself runs on.
+- Written in Kotlin, compiled against the Spigot 1.8.8 API as Java 8 bytecode, so it runs on any Java the server itself runs on. The Kotlin runtime is bundled and relocated to `dev.etran.libs.kotlin`, so it never clashes with other plugins (the jar is ~1.3 MB because of it).
 - No Paper-only API and no Adventure; messages use legacy `ChatColor`.
 - Anything newer than 1.8 (command map access, `syncCommands`, `updateCommands`, clickable chat components, Paper's plugin metadata) goes through reflection and degrades gracefully if missing. Without clickable chat, players just get plain text and type the command.
 - The menu uses only paper items and standard inventory events, so it works on every version.
 - Not Folia compatible.
 
 ## Build
-`mvn package` (any JDK 8+; output is Java 8 bytecode). The jar ends up in `target/`.
+`mvn package` (any JDK 8+; sources are in `src/main/kotlin`, output is Java 8 bytecode). The shaded jar ends up in `target/` as `PluginSync-<version>.jar`.
 
 ## Config
 `plugins/PluginSync/config.yml`:
 - `ignore:` plugin names that sync/scan will never load or unload.
 - `archive-unchosen:` see above (default `true`).
+
 ## Developer note
 This plugin is coded with AI assistance and architected completely by me. Regardless, use at your own risk.
 
