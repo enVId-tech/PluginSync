@@ -1,22 +1,36 @@
 # PluginSync
 
-Adds a command that detects plugin jars added to or removed from `plugins/` and loads or unloads just those. Plugins that are already running are never reloaded.
+Detects plugin jars added to or removed from `plugins/` and loads or unloads just those, and lets you enable, disable, restart or reload one specific plugin. Plugins you don't name are never touched.
 
 ## Install
-Drop `PluginSync-1.0.0.jar` into `plugins/` and restart once. After that:
+Drop `PluginSync-1.2.0.jar` into `plugins/` and restart once.
+
+## Commands
+Permission for all of them: `pluginsync.use` (default: op). They work from the console too. Alias: `/psync`.
 
 | Command | What it does |
 |---|---|
-| `/pluginsync scan` | Dry run: shows what would be loaded/unloaded |
-| `/pluginsync` (or `/psync`) | Loads new jars, unloads plugins whose jar was deleted |
+| `/pluginsync` | Load jars that were added, unload plugins whose jar was deleted |
+| `/pluginsync scan` | Dry run: show what the above would do |
+| `/pluginsync enable <plugin>` | Turn a disabled plugin on |
+| `/pluginsync disable <plugin>` | Turn a plugin off (it stays loaded, so `enable` brings it back) |
+| `/pluginsync restart <plugin>` | Disable then enable the same plugin (no jar re-read) |
+| `/pluginsync reload <plugin>` | Unload and load it again from its jar, so a replaced jar takes effect |
 
-Permission: `pluginsync.use` (default: op). Works from console too.
+`disable`, `restart` and `reload` refuse if another enabled plugin depends on the target. Add `-f` to do it anyway (you'll get a warning that the dependents may misbehave until a restart). PluginSync won't act on itself. Plugin names tab-complete.
+
+## Compatibility
+Targets Bukkit/Spigot/Paper/Purpur from 1.8 through 26.x with a single jar:
+- Compiled against the Spigot 1.8.8 API as Java 8 bytecode, so it runs on any Java the server itself runs on.
+- No Paper-only API and no Adventure; messages use legacy `ChatColor`.
+- Anything newer than 1.8 (command map access, `syncCommands`, `updateCommands`, Paper's plugin metadata) goes through reflection and degrades gracefully if missing.
+- Not Folia compatible.
 
 ## Build
-`mvn package` (Java 21). The jar ends up in `target/`. Change `paper.api.version` in `pom.xml` to compile against a newer Paper API.
+`mvn package` (any JDK 8+; output is Java 8 bytecode). The jar ends up in `target/`.
 
 ## Config
-`plugins/PluginSync/config.yml` has an `ignore:` list of plugin names that PluginSync will never load or unload.
+`plugins/PluginSync/config.yml` has an `ignore:` list of plugin names that the scan/sync will never load or unload.
 
 ## Developer note
 This plugin is coded with AI assistance and architected completely by me. Regardless, use at your own risk.

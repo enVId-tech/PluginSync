@@ -202,29 +202,8 @@ final class Syncer {
 
         // 2. Load new plugins, dependencies first.
         for (JarInfo info : order(plan.toLoad)) {
-            Plugin p = null;
-            try {
-                p = pm.loadPlugin(info.file);
-                if (p == null) {
-                    out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName()));
-                    continue;
-                }
-                p.onLoad();
-                pm.enablePlugin(p);
+            if (loadJar(info, out)) {
                 changed = true;
-                if (p.isEnabled()) {
-                    out.add(new Line(ChatColor.GREEN, "Loaded " + info.name + " " + info.version));
-                } else {
-                    cleanup(p);
-                    out.add(new Line(ChatColor.RED, info.name
-                            + " loaded but failed to enable (see console); it was unloaded again"));
-                }
-            } catch (Throwable t) {
-                self.getLogger().log(Level.WARNING, "Failed to load " + info.file.getName(), t);
-                if (p != null) {
-                    cleanup(p);
-                }
-                out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName() + ": " + describe(t)));
             }
         }
 
@@ -233,6 +212,191 @@ final class Syncer {
         }
         out.addAll(plan.notes);
         return out;
+    }
+
+    /** Loads and enables one jar. Returns true if the set of loaded plugins may have changed. */
+    private boolean loadJar(JarInfo info, List<Line> out) {
+        PluginManager pm = Bukkit.getPluginManager();
+        Plugin p = null;
+        try {
+            p = pm.loadPlugin(info.file);
+            if (p == null) {
+                out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName()));
+                return false;
+            }
+            p.onLoad();
+            pm.enablePlugin(p);
+            if (p.isEnabled()) {
+                out.add(new Line(ChatColor.GREEN, "Loaded " + info.name + " " + info.version));
+            } else {
+                cleanup(p);
+                out.add(new Line(ChatColor.RED, info.name
+                        + " loaded but failed to enable (see console); it was unloaded again"));
+            }
+            return true;
+        } catch (Throwable t) {
+            self.getLogger().log(Level.WARNING, "Failed to load " + info.file.getName(), t);
+            if (p != null) {
+                cleanup(p);
+            }
+            out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName() + ": " + describe(t)));
+            return p != null;
+        }
+    }
+
+    // ------------------------------------------------- single-plugin actions
+
+    /** Turn a loaded-but-disabled plugin on. */
+    List<Line> enable(Plugin p) {
+        List<Line> out = new ArrayList<Line>();
+        if (p.isEnabled()) {
+            out.add(new Line(ChatColor.YELLOW, p.getName() + " is already enabled"));
+            return out;
+        }
+        Bukkit.getPluginManager().enablePlugin(p);
+        if (p.isEnabled()) {
+            refreshCommands();
+            out.add(new Line(ChatColor.GREEN, "Enabled " + p.getName()));
+        } else {
+            out.add(new Line(ChatColor.RED, p.getName() + " failed to enable (see console)"));
+        }
+        return out;
+    }
+
+    /** Turn an enabled plugin off (it stays loaded, so /pluginsync enable brings it back). */
+    List<Line> disable(Plugin p, boolean force) {
+        List<Line> out = new ArrayList<Line>();
+        if (!p.isEnabled()) {
+            out.add(new Line(ChatColor.YELLOW, p.getName() + " is already disabled"));
+            return out;
+        }
+        List<String> dependents = enabledDependents(p);
+        if (!dependents.isEmpty() && !force) {
+            out.add(blockedBy(p, dependents));
+            return out;
+        }
+        Bukkit.getPluginManager().disablePlugin(p);
+        removeCommands(p);
+        refreshCommands();
+        out.add(new Line(ChatColor.GOLD, "Disabled " + p.getName()));
+        if (!dependents.isEmpty()) {
+            out.add(forcedWarning(dependents));
+        }
+        return out;
+    }
+
+    /** Disable then enable the same plugin instance (no jar re-read, no new classes). */
+    List<Line> restart(Plugin p, boolean force) {
+        List<Line> out = new ArrayList<Line>();
+        PluginManager pm = Bukkit.getPluginManager();
+        List<String> dependents = enabledDependents(p);
+        if (p.isEnabled() && !dependents.isEmpty() && !force) {
+            out.add(blockedBy(p, dependents));
+            return out;
+        }
+        if (p.isEnabled()) {
+            pm.disablePlugin(p);
+            removeCommands(p);
+        }
+        pm.enablePlugin(p);
+        refreshCommands();
+        if (p.isEnabled()) {
+            out.add(new Line(ChatColor.GREEN, "Restarted " + p.getName()));
+        } else {
+            out.add(new Line(ChatColor.RED, p.getName() + " failed to enable again (see console)"));
+        }
+        if (!dependents.isEmpty()) {
+            out.add(forcedWarning(dependents));
+        }
+        return out;
+    }
+
+    /** Unload the plugin and load it again from its jar, so a replaced jar takes effect. */
+    List<Line> reload(Plugin p, boolean force) {
+        List<Line> out = new ArrayList<Line>();
+        List<String> dependents = enabledDependents(p);
+        if (!dependents.isEmpty() && !force) {
+            out.add(blockedBy(p, dependents));
+            return out;
+        }
+        JarInfo jar = findJar(p.getName());
+        if (jar == null) {
+            out.add(new Line(ChatColor.RED, "Can't reload " + p.getName()
+                    + ": no jar with that plugin name in the plugins folder"));
+            return out;
+        }
+        if (jar.paperOnly) {
+            out.add(new Line(ChatColor.RED, "Can't reload " + p.getName()
+                    + ": its jar only has a paper-plugin.yml, which can't be loaded at runtime"));
+            return out;
+        }
+        try {
+            unload(p);
+            out.add(new Line(ChatColor.GOLD, "Unloaded " + p.getName()));
+        } catch (Throwable t) {
+            self.getLogger().log(Level.WARNING, "Failed to unload " + p.getName(), t);
+            out.add(new Line(ChatColor.RED, "Failed to unload " + p.getName() + ": " + describe(t)));
+            return out;
+        }
+        loadJar(jar, out);
+        refreshCommands();
+        if (!dependents.isEmpty()) {
+            out.add(forcedWarning(dependents));
+        }
+        return out;
+    }
+
+    private List<String> enabledDependents(Plugin p) {
+        List<String> names = new ArrayList<String>();
+        for (Plugin q : Bukkit.getPluginManager().getPlugins()) {
+            if (q != p && q.isEnabled() && dependsOn(q, p, false)) {
+                names.add(q.getName());
+            }
+        }
+        return names;
+    }
+
+    private static Line blockedBy(Plugin p, List<String> dependents) {
+        return new Line(ChatColor.RED, "Not touching " + p.getName() + ": " + join(dependents)
+                + " depend(s) on it. Add -f to do it anyway.");
+    }
+
+    private static Line forcedWarning(List<String> dependents) {
+        return new Line(ChatColor.YELLOW, "Warning: " + join(dependents)
+                + " depend(s) on this plugin and may misbehave until restarted.");
+    }
+
+    private static String join(List<String> parts) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(parts.get(i));
+        }
+        return sb.toString();
+    }
+
+    /** The jar in the plugins folder whose plugin.yml name matches, or null. */
+    private JarInfo findJar(String pluginName) {
+        File dir = self.getDataFolder().getAbsoluteFile().getParentFile();
+        File[] jars = dir.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File d, String n) {
+                return n.toLowerCase(Locale.ROOT).endsWith(".jar");
+            }
+        });
+        if (jars == null) {
+            return null;
+        }
+        Arrays.sort(jars);
+        for (File jar : jars) {
+            JarInfo info = JarInfo.read(jar);
+            if (info != null && info.name.equalsIgnoreCase(pluginName)) {
+                return info;
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- unload
