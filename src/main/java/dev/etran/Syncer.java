@@ -278,7 +278,12 @@ final class Syncer {
         loadJar(jar, out);
         refreshCommands();
         Plugin now = Bukkit.getPluginManager().getPlugin(jar.name);
-        return now != null && now.isEnabled();
+        boolean ok = now != null && now.isEnabled();
+        if (!ok) {
+            out.add(new Line(ChatColor.YELLOW, jar.name + " is not loaded right now. Fix the problem shown "
+                    + "above (see the console), then run /pluginsync to load it again."));
+        }
+        return ok;
     }
 
     /** Move the jars that were not chosen into plugins/PluginSync/archived/ (never deletes). */
@@ -394,11 +399,17 @@ final class Syncer {
             return true;
         } catch (Throwable t) {
             self.getLogger().log(Level.WARNING, "Failed to load " + info.file.getName(), t);
-            if (p != null) {
-                cleanup(p);
+            // Some servers register the plugin before the failure surfaces. Nothing with this
+            // name was loaded when we started (callers guarantee that), so anything found now
+            // is a half-registered leftover and must go, or the next attempt hits a ghost.
+            Plugin leftover = p != null ? p : pm.getPlugin(info.name);
+            if (leftover != null) {
+                cleanup(leftover);
             }
             out.add(new Line(ChatColor.RED, "Failed to load " + info.file.getName() + ": " + describe(t)));
-            return p != null;
+            out.add(new Line(ChatColor.GRAY, "The server console has the full error and usually a more specific "
+                    + "reason logged just above it."));
+            return true;
         }
     }
 
@@ -503,8 +514,7 @@ final class Syncer {
             out.add(new Line(ChatColor.RED, "Failed to unload " + p.getName() + ": " + describe(t)));
             return out;
         }
-        loadJar(jar, out);
-        refreshCommands();
+        loadAndCheck(jar, out);
         if (!dependents.isEmpty()) {
             out.add(forcedWarning(dependents));
         }
@@ -575,6 +585,12 @@ final class Syncer {
         purge(readField(pm, "instanceManager"), plugin);
         if (pluginLoader != null) {
             purge(pluginLoader, loader);   // the loader's registry of plugin class loaders
+        }
+        // Paper keeps its own records behind the Bukkit manager; without clearing them the plugin
+        // can't be loaded again ("attempted to add duplicate plugin identifier").
+        int cleared = PaperRegistry.forget(pm, plugin, plugin.getName(), loader);
+        if (cleared > 0) {
+            self.getLogger().info("Cleared " + cleared + " Paper registry entries for " + plugin.getName());
         }
 
         if (loader instanceof Closeable) {
@@ -795,7 +811,20 @@ final class Syncer {
         }
     }
 
+    /** "Exception: message", plus the root cause when it differs. */
     private static String describe(Throwable t) {
+        Throwable root = t;
+        for (int i = 0; i < 10 && root.getCause() != null && root.getCause() != root; i++) {
+            root = root.getCause();
+        }
+        String text = summary(t);
+        if (root != t) {
+            text += " (cause: " + summary(root) + ")";
+        }
+        return text;
+    }
+
+    private static String summary(Throwable t) {
         String msg = t.getMessage();
         return t.getClass().getSimpleName() + (msg == null ? "" : ": " + msg);
     }
