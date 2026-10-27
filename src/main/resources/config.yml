@@ -1,0 +1,5 @@
+ignore: []
+# Plugin names (case-insensitive) that PluginSync should never load or unload.
+# Example:
+# ignore:
+#   - SomeFragilePlugin

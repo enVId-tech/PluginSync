@@ -1,0 +1,15 @@
+name: PluginSync
+version: ${project.version}
+main: dev.etran.PluginSyncPlugin
+api-version: "1.21"
+description: Detects plugin jars added to or removed from the plugins folder and loads/unloads just those, without reloading anything else.
+commands:
+  pluginsync:
+    description: Load newly added plugin jars and unload removed ones
+    usage: /<command> [scan|sync]
+    aliases: [psync]
+    permission: pluginsync.use
+permissions:
+  pluginsync.use:
+    description: Allows use of /pluginsync
+    default: op
